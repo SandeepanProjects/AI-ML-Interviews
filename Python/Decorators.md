@@ -891,3 +891,862 @@ Original Function
 ```
 
 The original function stays focused on its core task, while decorators add reusable behavior around it. This pattern is heavily used in production AI systems to implement observability, authentication, retries, caching, validation, and framework features without duplicating code.
+
+
+# Python Decorators
+
+Decorators are a **very common Senior Python interview topic** because they are heavily used in:
+
+* FastAPI (`@app.get`, authentication middleware)
+* Flask/Django routes
+* Logging
+* Retry mechanisms
+* Caching
+* Monitoring
+* ML pipelines
+* API rate limiting
+
+---
+
+# What is a Decorator?
+
+A decorator is a function that:
+
+1. Takes another function as input
+2. Adds extra behavior
+3. Returns a new function
+
+In simple words:
+
+> A decorator wraps an existing function without modifying its original code.
+
+---
+
+# Basic Example
+
+Without decorator:
+
+```python
+id="basic"
+def hello():
+    print("Hello")
+
+
+hello()
+```
+
+Output:
+
+```
+Hello
+```
+
+Now we want logging:
+
+```
+Function started
+Hello
+Function finished
+```
+
+Instead of modifying `hello()`:
+
+```python
+id="modify"
+def hello():
+    print("Starting")
+    print("Hello")
+    print("Finished")
+```
+
+We create a decorator.
+
+---
+
+# How Decorator Works Internally
+
+Example:
+
+```python
+id="internal"
+@timer
+def process():
+    pass
+```
+
+Python converts this into:
+
+```python
+id="conversion"
+process = timer(process)
+```
+
+The decorator receives the original function and replaces it.
+
+---
+
+# Function as First-Class Object
+
+Decorators work because functions are objects.
+
+You can:
+
+### Pass functions
+
+```python
+id="pass"
+def greet():
+    print("Hello")
+
+
+def execute(fn):
+    fn()
+
+
+execute(greet)
+```
+
+---
+
+### Return functions
+
+```python
+id="return"
+def outer():
+
+    def inner():
+        print("Inside")
+
+    return inner
+```
+
+---
+
+# 1. Timer Decorator
+
+Question:
+
+> Write a decorator to measure execution time.
+
+Implementation:
+
+```python
+id="timer"
+import time
+
+
+def timer(func):
+
+    def wrapper(*args, **kwargs):
+
+        start = time.time()
+
+        result = func(*args, **kwargs)
+
+        end = time.time()
+
+        print(
+            f"{func.__name__} took {end-start:.4f} seconds"
+        )
+
+        return result
+
+    return wrapper
+```
+
+Usage:
+
+```python
+id="timer_usage"
+@timer
+def calculate():
+
+    time.sleep(2)
+
+    return "done"
+
+
+print(calculate())
+```
+
+Output:
+
+```
+calculate took 2.0001 seconds
+done
+```
+
+---
+
+## Flow
+
+```text
+calculate()
+
+↓
+
+wrapper()
+
+↓
+
+start timer
+
+↓
+
+original calculate()
+
+↓
+
+end timer
+
+↓
+
+return result
+```
+
+---
+
+# Why use `*args` and `**kwargs`?
+
+Because the decorator should work with any function.
+
+Example:
+
+```python
+id="args"
+@timer
+def add(a,b):
+    return a+b
+```
+
+Wrapper receives:
+
+```python
+id="wrapper_args"
+wrapper(10,20)
+```
+
+So:
+
+```python
+id="forward"
+func(*args, **kwargs)
+```
+
+passes everything correctly.
+
+---
+
+# Preserve Function Metadata
+
+Problem:
+
+```python
+id="metadata"
+print(calculate.__name__)
+```
+
+Output:
+
+```
+wrapper
+```
+
+because the decorator replaced the function.
+
+Solution:
+
+```python
+id="wraps"
+from functools import wraps
+
+
+def timer(func):
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+
+        start=time.time()
+
+        result=func(*args,**kwargs)
+
+        end=time.time()
+
+        print(end-start)
+
+        return result
+
+    return wrapper
+```
+
+Now:
+
+```python
+id="name"
+calculate.__name__
+```
+
+returns:
+
+```
+calculate
+```
+
+---
+
+# 2. Logging Decorator
+
+Requirement:
+
+Before every function call:
+
+```
+Calling function
+Arguments
+Result
+```
+
+Implementation:
+
+```python
+id="logging"
+from functools import wraps
+
+
+def logger(func):
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+
+        print(
+            f"Calling {func.__name__}"
+        )
+
+        print(
+            "Arguments:",
+            args,
+            kwargs
+        )
+
+
+        result = func(*args, **kwargs)
+
+
+        print(
+            "Result:",
+            result
+        )
+
+        return result
+
+    return wrapper
+```
+
+Usage:
+
+```python
+id="logging_usage"
+@logger
+def multiply(a,b):
+
+    return a*b
+
+
+multiply(5,4)
+```
+
+Output:
+
+```
+Calling multiply
+Arguments: (5,4)
+Result:20
+```
+
+---
+
+# Production Logging Example
+
+In AI systems:
+
+```python
+id="ai_logging"
+@logger
+def generate_embedding(text):
+
+    return embedding_model.encode(text)
+```
+
+Logs:
+
+```
+generate_embedding started
+input length=500
+latency=120ms
+```
+
+---
+
+# 3. Retry Decorator
+
+Very common in production systems.
+
+Use cases:
+
+* API calls
+* LLM calls
+* Database operations
+* Network failures
+
+Example:
+
+```python
+id="retry"
+import time
+from functools import wraps
+
+
+def retry(
+    attempts=3,
+    delay=1
+):
+
+    def decorator(func):
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+
+            for i in range(attempts):
+
+                try:
+
+                    return func(
+                        *args,
+                        **kwargs
+                    )
+
+                except Exception as e:
+
+                    print(
+                        f"Attempt {i+1} failed"
+                    )
+
+                    time.sleep(delay)
+
+
+            raise Exception(
+                "All retries failed"
+            )
+
+        return wrapper
+
+    return decorator
+```
+
+Usage:
+
+```python
+id="retry_usage"
+@retry(attempts=3)
+def call_api():
+
+    print("Calling API")
+
+    raise Exception("Failure")
+
+
+call_api()
+```
+
+Output:
+
+```
+Calling API
+
+Attempt 1 failed
+
+Calling API
+
+Attempt 2 failed
+
+Calling API
+
+Attempt 3 failed
+```
+
+---
+
+## Production Retry Improvements
+
+Real systems use:
+
+### Exponential Backoff
+
+Instead of:
+
+```
+1 sec
+1 sec
+1 sec
+```
+
+use:
+
+```
+1 sec
+2 sec
+4 sec
+8 sec
+```
+
+Example:
+
+```python
+id="backoff"
+delay = 2 ** attempt
+```
+
+Used in:
+
+* OpenAI API retries
+* AWS SDK retries
+* Microservices
+
+---
+
+# 4. Authentication Decorator
+
+Very common in FastAPI/backend interviews.
+
+Requirement:
+
+Only logged-in users can call function.
+
+Example:
+
+```python
+id="auth"
+from functools import wraps
+
+
+def authenticate(func):
+
+    @wraps(func)
+    def wrapper(user,*args,**kwargs):
+
+        if not user.get("authenticated"):
+
+            raise Exception(
+                "Unauthorized"
+            )
+
+
+        return func(
+            user,
+            *args,
+            **kwargs
+        )
+
+    return wrapper
+```
+
+Usage:
+
+```python
+id="auth_usage"
+@authenticate
+def get_profile(user):
+
+    return user["name"]
+```
+
+---
+
+Call:
+
+```python
+id="auth_call"
+user={
+    "name":"John",
+    "authenticated":True
+}
+
+
+print(get_profile(user))
+```
+
+Output:
+
+```
+John
+```
+
+---
+
+Production Example:
+
+AI Enterprise System:
+
+```
+Request
+
+↓
+
+Authentication Decorator
+
+↓
+
+JWT Validation
+
+↓
+
+RBAC Check
+
+↓
+
+LLM Endpoint
+```
+
+---
+
+# 5. Cache Decorator
+
+Caching avoids repeated computation.
+
+Example:
+
+Without cache:
+
+```python
+id="nocache"
+expensive_function(10)
+```
+
+runs every time.
+
+With cache:
+
+```
+First call:
+Calculate
+
+Second call:
+Return stored result
+```
+
+---
+
+Implementation:
+
+```python
+id="cache"
+from functools import wraps
+
+
+def cache(func):
+
+    storage={}
+
+
+    @wraps(func)
+    def wrapper(*args,**kwargs):
+
+        key = (
+            args,
+            tuple(kwargs.items())
+        )
+
+
+        if key in storage:
+
+            print("Cache hit")
+
+            return storage[key]
+
+
+        print("Computing")
+
+        result = func(
+            *args,
+            **kwargs
+        )
+
+
+        storage[key]=result
+
+        return result
+
+
+    return wrapper
+```
+
+Usage:
+
+```python
+id="cache_usage"
+@cache
+def fibonacci(n):
+
+    if n<=1:
+        return n
+
+    return (
+        fibonacci(n-1)
+        +
+        fibonacci(n-2)
+    )
+```
+
+Now repeated calls are faster.
+
+---
+
+# Real AI Example: LLM Response Cache
+
+```python
+id="llm_cache"
+@cache
+def ask_llm(prompt):
+
+    return openai.chat(prompt)
+```
+
+First request:
+
+```
+User:
+Explain transformers
+
+↓
+
+LLM call
+
+↓
+
+Store response
+```
+
+Second request:
+
+```
+Same prompt
+
+↓
+
+Return cached answer
+```
+
+Benefits:
+
+* Lower cost
+* Lower latency
+* Higher throughput
+
+---
+
+# Decorator with Multiple Layers
+
+Production example:
+
+```python
+id="multi"
+@retry(3)
+@logger
+@timer
+@authenticate
+def generate_answer():
+
+    pass
+```
+
+Execution order:
+
+Decorators are applied bottom-up.
+
+Equivalent:
+
+```python
+id="order"
+generate_answer = retry(
+                    logger(
+                     timer(
+                      authenticate(
+                       generate_answer
+                      )
+                     )
+                    )
+                  )
+```
+
+Flow:
+
+```
+Retry
+
+↓
+
+Logging
+
+↓
+
+Timer
+
+↓
+
+Authentication
+
+↓
+
+Function
+```
+
+---
+
+# Interview Questions
+
+## Q1. What is a decorator?
+
+Strong answer:
+
+> A decorator is a higher-order function that takes another function, extends its behavior, and returns a new function without modifying the original function. It uses Python's first-class functions and closures.
+
+---
+
+## Q2. Why use `functools.wraps`?
+
+Answer:
+
+> `wraps` preserves the metadata of the original function such as name, docstring, and annotations. Without it, the wrapper replaces the original function metadata.
+
+---
+
+## Q3. Why use `*args` and `**kwargs`?
+
+Answer:
+
+> To make decorators generic so they can wrap functions with any number of positional and keyword arguments.
+
+---
+
+## Q4. Where are decorators used in production?
+
+Examples:
+
+| Use Case       | Example              |
+| -------------- | -------------------- |
+| API Routing    | FastAPI `@app.get()` |
+| Authentication | JWT validation       |
+| Logging        | Request tracing      |
+| Monitoring     | Latency metrics      |
+| Retry          | API failures         |
+| Caching        | Redis/local cache    |
+| Authorization  | RBAC                 |
+
+---
+
+# Senior AI Engineer Answer
+
+A strong interview answer:
+
+> Decorators provide a clean way to implement cross-cutting concerns such as authentication, logging, metrics, retries, caching, and tracing without polluting business logic. In AI production systems, decorators are commonly used around LLM calls to capture latency, token usage, cost, retries, failures, and access control while keeping model inference code clean.
+
