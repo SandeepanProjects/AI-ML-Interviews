@@ -516,3 +516,437 @@ Vector search + LLM dominates runtime.
 A strong answer:
 
 > “An agent framework is a control loop that enables an LLM to iteratively reason and act using external tools. It consists of a planner (often an LLM), a tool registry, an execution engine, and memory. The agent operates in a loop: it interprets the user goal, selects tools, executes them, stores observations in memory, and refines its plan until a termination condition is met. Production systems add safeguards like step limits, retries, timeouts, circuit breakers, and both short-term and long-term memory using vector databases. Advanced designs extend this into multi-agent systems with specialized roles such as planner, executor, and critic.”
+
+
+# Build a Lightweight Agent Framework (Senior AI Engineer Interview)
+
+One of the most common Senior AI Engineer coding interview questions is:
+
+> **"Design and implement a lightweight AI agent framework from scratch."**
+
+The interviewer wants to evaluate your understanding of:
+
+* LLM abstraction
+* Tool calling
+* Memory
+* Planning
+* Agent loop
+* Extensibility
+* Clean Architecture
+* Async programming
+* Production design
+
+We'll build a simplified version inspired by **LangChain**, **OpenAI Agents SDK**, and **AutoGen**, but implemented from scratch.
+
+---
+
+# Architecture
+
+```text
+                   +----------------------+
+                   |      User Input      |
+                   +----------+-----------+
+                              |
+                              v
+                   +----------------------+
+                   |       Agent          |
+                   +----------+-----------+
+                              |
+                +-------------+-------------+
+                |                           |
+                v                           v
+        +---------------+          +---------------+
+        |     Memory    |          |     LLM       |
+        +---------------+          +-------+-------+
+                                          |
+                                          v
+                                  +---------------+
+                                  |   Planner     |
+                                  +-------+-------+
+                                          |
+                               decides tool to call
+                                          |
+                                          v
+                              +----------------------+
+                              |      ToolManager     |
+                              +----------------------+
+                                          |
+                              +-----------+-----------+
+                              |           |           |
+                              v           v           v
+                           Search      Calculator    Weather
+```
+
+---
+
+# Project Structure
+
+```text
+agent_framework/
+
+    agent.py
+
+    planner.py
+
+    llm.py
+
+    memory.py
+
+    tools.py
+
+    registry.py
+
+    schemas.py
+
+    main.py
+```
+
+---
+
+# Step 1 — Tool Base Class
+
+```python
+from abc import ABC, abstractmethod
+
+
+class Tool(ABC):
+
+    name: str
+    description: str
+
+    @abstractmethod
+    def execute(self, query: str):
+        pass
+```
+
+Every tool implements the same interface.
+
+---
+
+# Step 2 — Calculator Tool
+
+```python
+class CalculatorTool(Tool):
+
+    name = "calculator"
+
+    description = "Performs arithmetic."
+
+    def execute(self, query):
+
+        return eval(query)
+```
+
+Example
+
+```python
+tool.execute("20*5")
+```
+
+Output
+
+```text
+100
+```
+
+---
+
+# Step 3 — Search Tool
+
+```python
+class SearchTool(Tool):
+
+    name = "search"
+
+    description = "Searches knowledge."
+
+    def execute(self, query):
+
+        return f"Searching for: {query}"
+```
+
+---
+
+# Step 4 — Tool Registry
+
+```python
+class ToolRegistry:
+
+    def __init__(self):
+
+        self.tools = {}
+
+    def register(self, tool):
+
+        self.tools[tool.name] = tool
+
+    def get(self, name):
+
+        return self.tools[name]
+```
+
+Register tools
+
+```python
+registry = ToolRegistry()
+
+registry.register(SearchTool())
+
+registry.register(CalculatorTool())
+```
+
+---
+
+# Step 5 — Memory
+
+Conversation history
+
+```python
+class Memory:
+
+    def __init__(self):
+
+        self.messages = []
+
+    def add(self, role, content):
+
+        self.messages.append(
+            {
+                "role": role,
+                "content": content
+            }
+        )
+
+    def history(self):
+
+        return self.messages
+```
+
+---
+
+# Step 6 — Planner
+
+Planner decides which tool to invoke.
+
+```python
+class Planner:
+
+    def decide(self, query):
+
+        if "+" in query:
+
+            return "calculator"
+
+        if "-" in query:
+
+            return "calculator"
+
+        if "*" in query:
+
+            return "calculator"
+
+        return "search"
+```
+
+Production systems use an LLM for planning, but rule-based planning is enough to demonstrate the architecture.
+
+---
+
+# Step 7 — LLM Wrapper
+
+```python
+class LLM:
+
+    def generate(self, prompt):
+
+        return f"LLM Response: {prompt}"
+```
+
+Later this can wrap OpenAI, Anthropic, Gemini, or a local model.
+
+---
+
+# Step 8 — Agent
+
+```python
+class Agent:
+
+    def __init__(
+        self,
+        planner,
+        registry,
+        memory,
+        llm
+    ):
+
+        self.planner = planner
+        self.registry = registry
+        self.memory = memory
+        self.llm = llm
+
+    def run(self, query):
+
+        self.memory.add("user", query)
+
+        tool_name = self.planner.decide(query)
+
+        tool = self.registry.get(tool_name)
+
+        result = tool.execute(query)
+
+        answer = self.llm.generate(result)
+
+        self.memory.add("assistant", answer)
+
+        return answer
+```
+
+---
+
+# Main
+
+```python
+planner = Planner()
+
+registry = ToolRegistry()
+
+registry.register(SearchTool())
+
+registry.register(CalculatorTool())
+
+memory = Memory()
+
+llm = LLM()
+
+agent = Agent(
+    planner,
+    registry,
+    memory,
+    llm
+)
+
+print(agent.run("2+8"))
+```
+
+Output
+
+```text
+LLM Response: 10
+```
+
+---
+
+# Flow Diagram
+
+```text
+User
+
+↓
+
+Agent
+
+↓
+
+Planner
+
+↓
+
+Calculator Tool
+
+↓
+
+Result = 10
+
+↓
+
+LLM
+
+↓
+
+Final Answer
+```
+
+---
+
+# Adding Multiple Tools
+
+```python
+registry.register(SearchTool())
+
+registry.register(CalculatorTool())
+
+registry.register(SQLTool())
+
+registry.register(PDFTool())
+
+registry.register(WebTool())
+
+registry.register(ImageTool())
+```
+
+The agent architecture does not need to change—only the registry grows.
+
+---
+
+# Async Version
+
+Real agents often perform I/O (web search, database access, APIs). Making tools asynchronous improves throughput.
+
+```python
+class Agent:
+
+    async def run(self, query):
+
+        tool_name = self.planner.decide(query)
+
+        tool = self.registry.get(tool_name)
+
+        result = await tool.execute(query)
+
+        return await self.llm.generate(result)
+```
+
+---
+
+# Production Improvements
+
+A senior-level implementation would extend this framework with:
+
+| Component           | Purpose                                                              |
+| ------------------- | -------------------------------------------------------------------- |
+| Tool Registry       | Dynamic tool discovery and registration                              |
+| Planner             | LLM-based reasoning (ReAct, function calling, or structured outputs) |
+| Memory              | Short-term conversation history plus long-term vector memory         |
+| Prompt Manager      | Versioned system prompts and templates                               |
+| Retry Logic         | Handle transient tool/API failures with exponential backoff          |
+| Observability       | Structured logs, metrics, traces, token usage, latency               |
+| Caching             | Cache repeated tool results and LLM responses                        |
+| Guardrails          | Input validation, output validation, policy enforcement              |
+| Streaming           | Stream tokens back to the client                                     |
+| Authentication      | Secure tool access and user isolation                                |
+| Multi-Agent Support | Delegate subtasks to specialized agents                              |
+| Human-in-the-Loop   | Escalate uncertain or high-risk actions                              |
+
+---
+
+# Time Complexity
+
+Assuming tool lookup is dictionary-based:
+
+| Operation                  | Complexity                                               |
+| -------------------------- | -------------------------------------------------------- |
+| Tool lookup                | **O(1)**                                                 |
+| Memory append              | **O(1)**                                                 |
+| Planner (rule-based)       | **O(n)** where *n* is the query length                   |
+| Tool execution             | Depends on the tool (local computation vs. external API) |
+| Overall framework overhead | **O(n)** plus tool execution time                        |
+
+---
+
+# How to Explain This in an Interview
+
+A strong explanation is:
+
+> "I separated the framework into independent components: an Agent orchestrates execution, a Planner selects the appropriate tool, a ToolRegistry manages available capabilities, Memory stores conversational state, and an LLM generates the final response. This separation of concerns makes the framework extensible—new tools or planners can be added without modifying the Agent. In production, I'd replace the rule-based planner with an LLM planner, add async execution, structured tool schemas, retries, observability, and persistent memory to support scalable, reliable agent workflows."
+
+This demonstrates both coding ability and an understanding of production-grade agent system design.
