@@ -1,0 +1,1176 @@
+# How would you deploy multiple LoRA adapters in production?
+
+This is a very important production LLM question.
+
+Imagine you have one base model:
+
+```text
+Llama 3.x Base Model
+```
+
+but different fine-tuned behaviors:
+
+```text
+                    ┌── Finance LoRA
+                    │
+Base Model ─────────┼── Legal LoRA
+                    │
+                    ├── Customer A LoRA
+                    │
+                    ├── Customer B LoRA
+                    │
+                    └── Medical LoRA
+```
+
+You **do not want to load a separate full 8B model for every customer or domain**.
+
+Instead:
+
+> **Load the base model once and dynamically select the appropriate LoRA adapter for each request.**
+
+Modern vLLM supports serving multiple LoRA adapters and selecting an adapter per request; its official docs also expose controls such as `max_loras`, `max_lora_rank`, and CPU caching. ([vLLM][1])
+
+---
+
+# 1. The production architecture
+
+A typical architecture:
+
+```text
+                        Client
+                          │
+                          ▼
+                    API Gateway
+                          │
+                          ▼
+                    Authentication
+                          │
+                          ▼
+                  Tenant Identification
+                          │
+                          ▼
+                   Adapter Registry
+                          │
+                  ┌───────┼────────┐
+                  ▼       ▼        ▼
+              Redis    PostgreSQL  Cache
+                  │
+                  ▼
+            Which adapter?
+                  │
+                  ▼
+       ┌──────────────────────────┐
+       │       vLLM Server        │
+       │                          │
+       │     Base LLM in GPU      │
+       │                          │
+       │  Finance LoRA            │
+       │  Legal LoRA              │
+       │  Customer A LoRA         │
+       │  Customer B LoRA         │
+       └──────────────────────────┘
+                          │
+                          ▼
+                       Response
+```
+
+The important part is:
+
+```text
+ONE BASE MODEL
+      +
+MULTIPLE SMALL ADAPTERS
+      =
+MULTI-TENANT MODEL SERVING
+```
+
+---
+
+# 2. Why not deploy separate models?
+
+Suppose you have:
+
+```text
+Base model size = 16 GB
+Number of customers = 100
+```
+
+### Bad architecture
+
+```text
+Customer A → 16 GB model
+Customer B → 16 GB model
+Customer C → 16 GB model
+...
+```
+
+Potential memory:
+
+```text
+100 × 16 GB = 1600 GB
+```
+
+### Better architecture
+
+```text
+One Base Model
+
+16 GB
+
++
+
+100 LoRA adapters
+
+Example:
+100 × 100 MB = 10 GB
+```
+
+The actual numbers depend on the model and adapter configuration, but the main advantage is:
+
+> **The large base model is shared; only the smaller LoRA differences vary by tenant or task.**
+
+---
+
+# 3. Adapter registry design
+
+In production, do not hardcode this:
+
+```python
+if customer == "customer_a":
+    adapter = "adapter_a"
+
+elif customer == "customer_b":
+    adapter = "adapter_b"
+```
+
+Instead, maintain an adapter registry.
+
+Example PostgreSQL schema:
+
+```sql
+CREATE TABLE lora_adapters (
+    id UUID PRIMARY KEY,
+    tenant_id UUID NOT NULL,
+
+    adapter_name VARCHAR(255) NOT NULL,
+    adapter_version VARCHAR(50) NOT NULL,
+
+    base_model VARCHAR(255) NOT NULL,
+
+    storage_uri TEXT NOT NULL,
+
+    status VARCHAR(50) NOT NULL,
+
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+
+    UNIQUE (
+        tenant_id,
+        adapter_name,
+        adapter_version
+    )
+);
+```
+
+Example data:
+
+```text
+tenant_id     adapter       version      status
+------------------------------------------------
+customer_a    finance-v1    1.0          ACTIVE
+customer_b    support-v3    3.0          ACTIVE
+customer_c    legal-v2      2.0          ACTIVE
+```
+
+---
+
+# 4. Store adapters separately
+
+A typical object storage structure:
+
+```text
+s3://company-models/
+
+    base-models/
+        llama-8b/
+
+    adapters/
+        tenant-a/
+            finance-v1/
+                adapter_model.safetensors
+                adapter_config.json
+
+        tenant-b/
+            support-v3/
+                adapter_model.safetensors
+                adapter_config.json
+```
+
+Important rule:
+
+```text
+Adapter
+   ↓
+Must be compatible with
+   ↓
+Base Model
+```
+
+For every adapter, store metadata such as:
+
+```json
+{
+    "adapter_name": "finance-v1",
+    "version": "1.0",
+    "base_model": "llama-base-v1",
+    "lora_rank": 16,
+    "dataset_version": "finance-data-v4",
+    "git_commit": "abc123"
+}
+```
+
+---
+
+# 5. Use vLLM to serve multiple adapters
+
+A practical production approach is vLLM.
+
+For example:
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    --enable-lora \
+    --max-loras 8 \
+    --max-lora-rank 64 \
+    --max-cpu-loras 32 \
+    --lora-modules \
+        finance=/models/adapters/finance \
+        legal=/models/adapters/legal \
+        support=/models/adapters/support
+```
+
+The vLLM server can expose preloaded adapters as selectable models through its OpenAI-compatible API. Its docs recommend setting `max_lora_rank` to the maximum rank actually required rather than unnecessarily overallocating memory. ([vLLM][1])
+
+---
+
+# 6. Request-specific adapter selection
+
+Your API can receive:
+
+```json
+{
+    "tenant_id": "customer_a",
+    "prompt": "Explain this financial transaction"
+}
+```
+
+Your backend determines:
+
+```text
+customer_a
+      │
+      ▼
+Adapter Registry
+      │
+      ▼
+finance-v1
+      │
+      ▼
+vLLM
+```
+
+Then call vLLM:
+
+```python
+import httpx
+
+
+async def generate(
+    adapter_name: str,
+    prompt: str
+):
+    async with httpx.AsyncClient() as client:
+
+        response = await client.post(
+            "http://vllm:8000/v1/completions",
+            json={
+                "model": adapter_name,
+                "prompt": prompt,
+                "max_tokens": 256,
+                "temperature": 0
+            }
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+```
+
+Usage:
+
+```python
+result = await generate(
+    adapter_name="finance",
+    prompt="Explain EBITDA"
+)
+```
+
+The adapter is selected per request.
+
+---
+
+# 7. FastAPI production service
+
+A simplified API:
+
+```python
+from fastapi import FastAPI, Depends, HTTPException
+from pydantic import BaseModel
+import httpx
+
+
+app = FastAPI()
+
+
+class GenerateRequest(BaseModel):
+    prompt: str
+
+
+class UserContext(BaseModel):
+    tenant_id: str
+
+
+async def get_current_user() -> UserContext:
+    # Real implementation:
+    # JWT validation
+    # Extract tenant_id
+    return UserContext(
+        tenant_id="tenant_a"
+    )
+
+
+ADAPTER_MAPPING = {
+    "tenant_a": "finance",
+    "tenant_b": "support",
+    "tenant_c": "legal"
+}
+
+
+async def get_adapter(
+    user: UserContext
+) -> str:
+
+    adapter = ADAPTER_MAPPING.get(
+        user.tenant_id
+    )
+
+    if not adapter:
+        raise HTTPException(
+            status_code=404,
+            detail="No model configured"
+        )
+
+    return adapter
+
+
+@app.post("/generate")
+async def generate_response(
+    request: GenerateRequest,
+    user: UserContext = Depends(
+        get_current_user
+    )
+):
+
+    adapter = await get_adapter(
+        user
+    )
+
+    async with httpx.AsyncClient(
+        timeout=60
+    ) as client:
+
+        response = await client.post(
+            "http://vllm:8000/v1/completions",
+            json={
+                "model": adapter,
+                "prompt": request.prompt,
+                "max_tokens": 512,
+                "temperature": 0
+            }
+        )
+
+    response.raise_for_status()
+
+    return response.json()
+```
+
+Production flow:
+
+```text
+JWT
+ │
+ ▼
+Extract tenant_id
+ │
+ ▼
+Lookup adapter
+ │
+ ▼
+Authorize tenant
+ │
+ ▼
+Call vLLM
+ │
+ ▼
+Use correct LoRA
+```
+
+---
+
+# 8. Don't let users choose arbitrary adapter paths
+
+This is dangerous:
+
+```python
+@app.post("/generate")
+async def generate(
+    adapter_path: str,
+    prompt: str
+):
+    ...
+```
+
+A user should never control:
+
+```text
+Adapter filesystem path
+S3 path
+Model repository
+Internal adapter ID
+```
+
+Instead:
+
+```text
+User identity
+      │
+      ▼
+Authorized tenant
+      │
+      ▼
+Server-side adapter registry
+      │
+      ▼
+Approved adapter
+```
+
+This is especially important because vLLM's runtime adapter loading is documented as having security risks and should only be enabled in an isolated, trusted environment. ([vLLM][1])
+
+---
+
+# 9. Redis cache for adapter mapping
+
+Database lookup on every request may be unnecessary.
+
+Use:
+
+```text
+Request
+   │
+   ▼
+Redis
+
+HIT
+ │
+ ▼
+Adapter name
+
+
+MISS
+ │
+ ▼
+PostgreSQL
+ │
+ ▼
+Redis cache
+```
+
+Example:
+
+```python
+async def get_adapter_for_tenant(
+    tenant_id: str,
+    redis,
+    repository
+):
+
+    cache_key = (
+        f"tenant_adapter:{tenant_id}"
+    )
+
+    adapter = await redis.get(
+        cache_key
+    )
+
+    if adapter:
+        return adapter
+
+    adapter = await repository.get_active_adapter(
+        tenant_id
+    )
+
+    if not adapter:
+        raise ValueError(
+            "No active adapter"
+        )
+
+    await redis.set(
+        cache_key,
+        adapter,
+        ex=300
+    )
+
+    return adapter
+```
+
+---
+
+# 10. Dynamic adapter loading
+
+Suppose you have:
+
+```text
+10,000 customers
+```
+
+You cannot necessarily keep all adapters in GPU memory.
+
+Use a cache:
+
+```text
+                GPU Cache
+
+        Adapter A
+        Adapter B
+        Adapter C
+        Adapter D
+
+              ▲
+              │
+        Frequently used
+
+
+Cold adapters
+       │
+       ▼
+CPU / Disk / Object Storage
+```
+
+Conceptually:
+
+```python
+class AdapterManager:
+
+    def __init__(
+        self,
+        max_gpu_adapters: int
+    ):
+
+        self.max_gpu_adapters = (
+            max_gpu_adapters
+        )
+
+        self.loaded_adapters = {}
+
+    async def get_adapter(
+        self,
+        adapter_id
+    ):
+
+        if adapter_id in self.loaded_adapters:
+
+            return self.loaded_adapters[
+                adapter_id
+            ]
+
+        adapter = await self.load_adapter(
+            adapter_id
+        )
+
+        await self.evict_if_needed()
+
+        self.loaded_adapters[
+            adapter_id
+        ] = adapter
+
+        return adapter
+```
+
+The real production implementation should handle:
+
+```text
+Concurrency
+Locks
+Eviction
+Reference counts
+Memory limits
+Failed loads
+Retries
+Versioning
+```
+
+vLLM provides server-level controls for concurrent LoRA serving and CPU-side adapter caching, such as `max_loras` and `max_cpu_loras`. ([vLLM][1])
+
+---
+
+# 11. LRU adapter cache
+
+A simple implementation:
+
+```python
+from collections import OrderedDict
+
+
+class LRUAdapterCache:
+
+    def __init__(
+        self,
+        capacity: int
+    ):
+
+        self.capacity = capacity
+
+        self.cache = OrderedDict()
+
+
+    def get(
+        self,
+        adapter_id: str
+    ):
+
+        if adapter_id not in self.cache:
+
+            return None
+
+        self.cache.move_to_end(
+            adapter_id
+        )
+
+        return self.cache[
+            adapter_id
+        ]
+
+
+    def put(
+        self,
+        adapter_id: str,
+        adapter
+    ):
+
+        if adapter_id in self.cache:
+
+            self.cache.move_to_end(
+                adapter_id
+            )
+
+        self.cache[
+            adapter_id
+        ] = adapter
+
+        if len(self.cache) > self.capacity:
+
+            evicted_id, _ = (
+                self.cache.popitem(
+                    last=False
+                )
+            )
+
+            return evicted_id
+```
+
+Production strategy:
+
+```text
+Most frequently used adapters
+        ↓
+GPU
+
+Moderately used adapters
+        ↓
+CPU cache
+
+Rare adapters
+        ↓
+Object storage
+```
+
+---
+
+# 12. Kubernetes architecture
+
+For high availability:
+
+```text
+                    Load Balancer
+                          │
+                          ▼
+                    API Gateway
+                          │
+             ┌────────────┴────────────┐
+             │                         │
+             ▼                         ▼
+         API Pod 1                 API Pod 2
+             │                         │
+             └────────────┬────────────┘
+                          │
+                          ▼
+                      Redis
+                          │
+                          ▼
+                    PostgreSQL
+                          │
+                          ▼
+              ┌───────────────────┐
+              │ GPU Node Pool     │
+              │                   │
+              │ ┌───────────────┐ │
+              │ │ vLLM Pod 1    │ │
+              │ │ Base Model    │ │
+              │ │ + LoRA Cache  │ │
+              │ └───────────────┘ │
+              │                   │
+              │ ┌───────────────┐ │
+              │ │ vLLM Pod 2    │ │
+              │ │ Base Model    │ │
+              │ │ + LoRA Cache  │ │
+              │ └───────────────┘ │
+              └───────────────────┘
+```
+
+Kubernetes allows:
+
+```text
+Multiple replicas
+Health checks
+Autoscaling
+Rolling deployments
+GPU scheduling
+Failure recovery
+```
+
+The vLLM production stack also documents Kubernetes/Helm patterns for LoRA-enabled serving, including shared storage and adapter lifecycle management. ([GitHub][2])
+
+---
+
+# 13. Example Kubernetes deployment
+
+A simplified deployment:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: vllm-server
+
+spec:
+
+  replicas: 2
+
+  selector:
+
+    matchLabels:
+      app: vllm
+
+
+  template:
+
+    metadata:
+
+      labels:
+        app: vllm
+
+
+    spec:
+
+      containers:
+
+        - name: vllm
+
+          image: vllm/vllm-openai:latest
+
+          args:
+
+            - "meta-llama/Llama-3.1-8B-Instruct"
+
+            - "--enable-lora"
+
+            - "--max-loras"
+            - "8"
+
+            - "--max-lora-rank"
+            - "64"
+
+            - "--max-cpu-loras"
+            - "32"
+
+          resources:
+
+            limits:
+
+              nvidia.com/gpu: 1
+```
+
+For a real production deployment, pin image versions instead of using `latest`.
+
+---
+
+# 14. Multi-tenant routing
+
+A robust mapping might be:
+
+```text
+Tenant
+   │
+   ▼
+Tenant Configuration
+   │
+   ├── Adapter
+   ├── Adapter Version
+   ├── Base Model
+   ├── Rate Limit
+   ├── Token Limit
+   └── Deployment Region
+```
+
+Example:
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass
+class TenantModelConfig:
+
+    tenant_id: str
+
+    adapter_name: str
+
+    adapter_version: str
+
+    base_model: str
+
+    max_tokens: int
+```
+
+Routing:
+
+```python
+async def route_request(
+    tenant_id: str,
+    prompt: str
+):
+
+    config = await get_tenant_config(
+        tenant_id
+    )
+
+    response = await generate(
+        adapter_name=config.adapter_name,
+        prompt=prompt
+    )
+
+    return response
+```
+
+---
+
+# 15. Adapter versioning
+
+Never replace:
+
+```text
+finance-v1
+```
+
+silently.
+
+Use:
+
+```text
+finance-v1.0
+finance-v1.1
+finance-v2.0
+```
+
+Database:
+
+```text
+tenant       adapter       version     status
+------------------------------------------------
+customer_a   finance       1.0         ARCHIVED
+customer_a   finance       1.1         ACTIVE
+customer_a   finance       2.0         CANARY
+```
+
+This supports rollback:
+
+```text
+Version 2
+   │
+   ▼
+Error detected
+   │
+   ▼
+Registry update
+   │
+   ▼
+Version 1.1
+```
+
+No need to redeploy the entire base model.
+
+---
+
+# 16. Canary deployment for adapters
+
+Do not immediately send all traffic to a new adapter.
+
+```text
+finance-v1
+   │
+   ├── 90% traffic
+   │
+   └── 10% traffic
+            │
+            ▼
+       finance-v2
+```
+
+Code:
+
+```python
+import random
+
+
+def choose_adapter():
+
+    value = random.random()
+
+    if value < 0.10:
+
+        return "finance-v2"
+
+    return "finance-v1"
+```
+
+Better: use deterministic routing based on a stable hash, so the same user consistently sees the same version.
+
+```python
+import hashlib
+
+
+def choose_adapter_for_user(
+    user_id: str
+):
+
+    value = int(
+        hashlib.sha256(
+            user_id.encode()
+        ).hexdigest(),
+        16
+    ) % 100
+
+    if value < 10:
+        return "finance-v2"
+
+    return "finance-v1"
+```
+
+---
+
+# 17. Observability
+
+For every request, track:
+
+```text
+tenant_id
+adapter_name
+adapter_version
+base_model
+request_latency
+TTFT
+tokens_generated
+tokens_per_second
+GPU memory
+cache_hit
+cache_miss
+errors
+cost
+```
+
+Example:
+
+```python
+logger.info(
+    "llm_request",
+    extra={
+
+        "tenant_id":
+            tenant_id,
+
+        "adapter":
+            adapter_name,
+
+        "adapter_version":
+            adapter_version,
+
+        "latency_ms":
+            latency_ms,
+
+        "tokens":
+            tokens
+    }
+)
+```
+
+Metrics:
+
+```text
+lora_requests_total
+lora_latency_seconds
+lora_cache_hits_total
+lora_cache_misses_total
+lora_load_duration_seconds
+lora_adapter_errors_total
+```
+
+---
+
+# 18. Important production problem: noisy neighbors
+
+Suppose:
+
+```text
+Tenant A → 10 requests/minute
+Tenant B → 10,000 requests/minute
+```
+
+Tenant B could consume all GPU capacity.
+
+Use:
+
+```text
+Rate limiting
+Per-tenant quotas
+Concurrency limits
+Priority queues
+Separate GPU pools for premium customers
+```
+
+Example:
+
+```text
+Tenant A
+Concurrency = 5
+
+Tenant B
+Concurrency = 20
+
+Tenant C
+Concurrency = 2
+```
+
+This is particularly important in a multi-tenant AI platform.
+
+---
+
+# 19. What if one adapter is very popular?
+
+Example:
+
+```text
+Adapter A → 80% traffic
+Adapter B → 10%
+Adapter C → 5%
+Other adapters → 5%
+```
+
+Optimize:
+
+```text
+GPU 1
+  Adapter A permanently warm
+
+GPU 2
+  Adapter A permanently warm
+
+GPU 3
+  Dynamic adapters
+
+GPU 4
+  Dynamic adapters
+```
+
+This avoids repeatedly loading the most popular adapter.
+
+---
+
+# 20. Recommended production setup
+
+For your interview answer, I would recommend:
+
+```text
+                 API Gateway
+                      │
+                      ▼
+                FastAPI Service
+                      │
+             ┌────────┴────────┐
+             ▼                 ▼
+        PostgreSQL           Redis
+        Adapter Registry      Cache
+             │
+             ▼
+       Authorized Adapter
+             │
+             ▼
+        Kubernetes Router
+             │
+             ▼
+      ┌──────────────────────┐
+      │     vLLM Cluster     │
+      │                      │
+      │ Shared Base Model    │
+      │                      │
+      │ GPU Adapter Cache    │
+      │ CPU Adapter Cache    │
+      └──────────────────────┘
+             │
+             ▼
+          Response
+```
+
+---
+
+# Strong interview answer
+
+> **I would deploy multiple LoRA adapters by serving one shared base model and selecting the LoRA adapter per request. Each adapter would be versioned and registered in an adapter registry containing the tenant, base-model compatibility, storage location, version, and deployment status.**
+>
+> **The API layer would authenticate the user, determine the tenant, and resolve the authorized adapter server-side rather than allowing users to provide arbitrary adapter paths. Redis would cache tenant-to-adapter mappings, while PostgreSQL would be the source of truth.**
+>
+> **For inference, I would use an engine such as vLLM with LoRA enabled. Frequently used adapters would remain warm in GPU memory, less frequently used adapters could be cached on CPU, and cold adapters would live in object storage. I would configure concurrency and maximum LoRA rank based on actual adapter characteristics.**
+>
+> **For scale, I would deploy multiple inference replicas on Kubernetes, add request routing, per-tenant rate limits, adapter-aware caching, monitoring, and autoscaling. Adapter deployments would use immutable versions with canary releases and fast rollback through the adapter registry. I would also isolate adapter management because runtime loading from untrusted paths introduces security risks.** ([vLLM][1])
+
+## The one-line answer to remember
+
+```text
+Load the base model once,
+share it across tenants,
+and dynamically select the
+correct versioned LoRA adapter per request.
+```
+
+[1]: https://docs.vllm.ai/en/stable/features/lora/?utm_source=chatgpt.com "LoRA Adapters - vLLM"
+[2]: https://github.com/vllm-project/production-stack/blob/main/tutorials/09-lora-enabled-installation.md?utm_source=chatgpt.com "production-stack/tutorials/09-lora-enabled-installation.md at main · vllm-project/production-stack · GitHub"
